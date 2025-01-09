@@ -1,13 +1,14 @@
 import asyncio
 import logging
 
-import requests
+from aiogram import Bot, Dispatcher, types
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
 from decouple import config
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
+from motor.motor_asyncio import AsyncIOMotorClient
 
 from .agregator import aggregate_salaries
-
-app = FastAPI()
 
 # Включение логирования
 logging.basicConfig(
@@ -16,72 +17,83 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Получение токена из конфигурации
 TOKEN = config('TELEGRAM_TOKEN')
-BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
+
+# Создание приложения FastAPI
+app = FastAPI()
+
+# Создание бота
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# Подключение к MongoDB через Motor
+client = AsyncIOMotorClient(config('HOST'))
+db = client.company_db
+collection = db.salaries
 
 
-def send_message(chat_id, text):
-    """ Метод отправки сообщения для телеграм """
-    url = f"{BASE_URL}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text
-    }
-    requests.post(url, json=payload)
+@dp.message(Command(commands=['start']))
+async def send_welcome(message: types.Message):
+    """ Приветствие """
+    await message.reply(
+        "Привет! Я могу помочь с агрегацией зарплат.\n"
+        "Используйте команду /aggregate.\n\n"
+        "Формат: /aggregate <dt_from> <dt_upto> <group_type>\n"
+        "Пример: /aggregate 2022-12-31T00:00:00 2022-12-31T23:59:00 hour"
+    )
 
 
-async def poll_updates():
-    offset = 0
-    while True:
-        url = f"{BASE_URL}/getUpdates"
-        payload = {"offset": offset, "timeout": 10}
-        response = requests.get(url, params=payload)
-        updates = response.json().get("result", [])
-
-        for update in updates:
-            offset = update['update_id'] + 1
-            if "message" in update:
-                chat_id = update["message"]["chat"]["id"]
-                text = update["message"].get("text", "")
-
-                if text.startswith("/start"):
-                    send_message(
-                        chat_id,
-                        ("Привет! Я могу помочь с агрегацией зарплат.\n"
-                         "Используйте команду /aggregate.\n\n"
-                         "Формат: /aggregate "
-                         "<dt_from> <dt_upto> <group_type>\n"
-                         "Пример: /aggregate "
-                         "2022-12-31T00:00:00 2022-12-31T23:59:00 hour")
-                    )
-
-                elif text.startswith("/aggregate"):
-                    try:
-                        _, dt_from, dt_upto, group_type = text.split()
-                        result = aggregate_salaries(
-                            dt_from, dt_upto, group_type
-                        )
-                        response = (
-                            "Aggregated salaries:\n"
-                            f"Labels: {result['labels']}\n"
-                            f"Dataset: {result['dataset']}"
-                        )
-                        send_message(chat_id, response)
-                    except Exception as e:
-                        send_message(
-                            chat_id,
-                            ("Ошибка в агрегации. Использование: /aggregate "
-                             "<dt_from> <dt_upto> <group_type>")
-                        )
-                        logger.error(f"Ошибка в агрегации: {e}")
-
-                if text.startswith('/hi'):
-                    send_message(chat_id, 'Привет!')
-
-        await asyncio.sleep(1)
+@dp.message(Command(commands=['aggregate']))
+async def handle_aggregate(message: types.Message):
+    """ Агрегация данных """
+    try:
+        _, dt_from, dt_upto, group_type = message.text.split()
+        result = await aggregate_salaries(dt_from,
+                                          dt_upto,
+                                          group_type,
+                                          collection)
+        response = (
+            "Aggregated salaries:\n"
+            f"Labels: {result['labels']}\n"
+            f"Dataset: {result['dataset']}"
+        )
+        await message.reply(response, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await message.reply(
+            "Ошибка в агрегации. Использование: /aggregate "
+            "<dt_from> <dt_upto> <group_type>"
+        )
+        logger.error(f"Ошибка в агрегации: {e}")
 
 
 @app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(poll_updates())
+async def on_startup():
+    """ Запуск Aiogram в фоне """
+    asyncio.create_task(dp.start_polling(bot))
+
+
+@app.get(
+    "/items/",
+    summary="Получение агрегации данных.",
+    description="Возвращает агрегацию данных на основе предоставленных "
+                "временных рамок и интервала."
+)
+async def read_salary(
+        dt_from: str = Query(
+            description="Начальная дата и время в формате ISO 8601."
+                        " Пример: 2022-12-31T00:00:00"),
+        dt_upto: str = Query(
+            description="Конечная дата и время в формате ISO 8601."
+                        " Пример: 2022-12-31T23:59:00"),
+        group_type: str = Query(
+            description="Временной интервал: hour, day, month, year.")
+) -> dict[str, list]:
+    """
+    Получение агрегации данных
+
+    - **dt_from**: Начальная дата и время для агрегации.
+    - **dt_upto**: Конечная дата и время для агрегации.
+    - **group_type**: Временной интервал: hour, day, month, year.
+    """
+    result = await aggregate_salaries(dt_from, dt_upto, group_type, collection)
+    return result
