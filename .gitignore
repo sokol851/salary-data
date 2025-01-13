@@ -171,4 +171,4 @@ venv/
 .env
 contact_info.csv
 test_smtp.py
-README.mdx
+.vscode/
